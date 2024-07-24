@@ -1,14 +1,15 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0">
 
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.2</version>
+    </parent>
+
     <groupId>com.github.heng</groupId>
     <artifactId>spring-bytebuddy-tools</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-
-    <parent>
-        <groupId>com.github.heng</groupId>
-        <artifactId>spring-bytebuddy-tools</artifactId>
-        <version>0.0.1-SNAPSHOT</version>
-    </parent>
 
     <modules>
         <module>spring-enhancer</module>
@@ -24,7 +25,6 @@
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <bytebuddy.version>1.14.18</bytebuddy.version>
-        <spring.boot.version>3.2.4</spring.boot.version>
     </properties>
 
 </project>
