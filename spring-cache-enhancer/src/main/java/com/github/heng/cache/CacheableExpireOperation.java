@@ -23,6 +23,10 @@ public class CacheableExpireOperation extends CacheableOperation {
         this.ttl = b.ttl;
     }
 
+    public Duration getTtl() {
+        return ttl;
+    }
+
     public static class Builder extends CacheableOperation.Builder {
         private Duration ttl;
 

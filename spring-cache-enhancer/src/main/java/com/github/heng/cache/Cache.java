@@ -13,14 +13,6 @@ import java.util.function.Supplier;
  */
 public interface Cache extends org.springframework.cache.Cache {
 
-    /**
-     * get key with valueLoader and ttl
-     * @param key   cache key
-     * @param valueLoader fetch value strategy if no value in cache
-     * @param ttl   ttl
-     * @return
-     * @param <T>
-     */
     @Nullable
     <T> T get(Object key, Callable<T> valueLoader, Duration ttl);
 
@@ -28,7 +20,6 @@ public interface Cache extends org.springframework.cache.Cache {
 
     void put(Object key, @Nullable Object value, Duration ttl);
 
-    @Nullable
     default ValueWrapper putIfAbsent(Object key, @Nullable Object value, Duration ttl) {
         ValueWrapper existingValue = get(key);
         if (existingValue == null) {

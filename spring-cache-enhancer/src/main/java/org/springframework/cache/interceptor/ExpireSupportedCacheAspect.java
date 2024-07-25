@@ -1,6 +1,5 @@
-package com.github.heng.cache;
+package org.springframework.cache.interceptor;
 
-import net.bytebuddy.implementation.bind.annotation.*;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.reactivestreams.Subscriber;
@@ -11,14 +10,10 @@ import org.springframework.beans.factory.*;
 import org.springframework.beans.factory.annotation.BeanFactoryAnnotationUtils;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
-import org.springframework.cache.interceptor.*;
 import org.springframework.context.expression.AnnotatedElementKey;
 import org.springframework.context.expression.BeanFactoryResolver;
-import org.springframework.context.expression.CachedExpressionEvaluator;
-import org.springframework.context.expression.MethodBasedEvaluationContext;
 import org.springframework.core.*;
 import org.springframework.expression.EvaluationContext;
-import org.springframework.expression.Expression;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.lang.Nullable;
 import org.springframework.util.*;
@@ -30,7 +25,6 @@ import reactor.core.publisher.Mono;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.*;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
@@ -38,30 +32,15 @@ import java.util.function.Supplier;
 /**
  * @author heng.ma
  */
-public class CacheInterceptor extends AbstractCacheInvoker
+public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
         implements BeanFactoryAware, InitializingBean, SmartInitializingSingleton {
-
-    @RuntimeType
-    public Object  bytebuddyInterceptor (@SuperCall Callable<?> callable, @This Object target, @Origin Method method, @AllArguments Object[] args) {
-        CacheOperationInvoker invoker = () -> {
-            try {
-                return callable.call();
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        };
-        return execute(invoker, target, method, args);
-    }
     public static final String IGNORE_REACTIVESTREAMS_PROPERTY_NAME = "spring.cache.reactivestreams.ignore";
-
-    public static final Object NO_RESULT = new Object();
-    public static final Object RESULT_UNAVAILABLE = new Object();
 
     private static final boolean shouldIgnoreReactiveStreams =
             SpringProperties.getFlag(IGNORE_REACTIVESTREAMS_PROPERTY_NAME);
 
     private static final boolean reactiveStreamsPresent = ClassUtils.isPresent(
-            "org.reactivestreams.Publisher", CacheInterceptor.class.getClassLoader());
+            "org.reactivestreams.Publisher", ExpireSupportedCacheAspect.class.getClassLoader());
 
 
     protected final Log logger = LogFactory.getLog(getClass());
@@ -70,7 +49,8 @@ public class CacheInterceptor extends AbstractCacheInvoker
 
     private final StandardEvaluationContext originalEvaluationContext = new StandardEvaluationContext();
 
-    private final CachedExpressionEvaluatorImpl evaluator = new CachedExpressionEvaluatorImpl(originalEvaluationContext);
+    private final CacheOperationExpressionEvaluator evaluator = new CacheOperationExpressionEvaluator(
+            new CacheEvaluationContextFactory(this.originalEvaluationContext));
 
     @Nullable
     private final ReactiveCachingHandler reactiveCachingHandler;
@@ -89,7 +69,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
     private boolean initialized = false;
 
 
-    public CacheInterceptor() {
+    protected ExpireSupportedCacheAspect() {
         this.reactiveCachingHandler =
                 (reactiveStreamsPresent && !shouldIgnoreReactiveStreams ? new ReactiveCachingHandler() : null);
     }
@@ -107,10 +87,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
         this.errorHandler = new SingletonSupplier<>(errorHandler, SimpleCacheErrorHandler::new);
         this.keyGenerator = new SingletonSupplier<>(keyGenerator, SimpleKeyGenerator::new);
         this.cacheResolver = new SingletonSupplier<>(cacheResolver,
-                () -> {
-                    CacheManager resolved = SupplierUtils.resolve(cacheManager);
-                    return resolved == null? null : new SimpleCacheResolver(resolved);
-                });
+                () -> SimpleCacheResolver.of(SupplierUtils.resolve(cacheManager)));
     }
 
 
@@ -180,17 +157,17 @@ public class CacheInterceptor extends AbstractCacheInvoker
     }
 
     /**
-     * Set the {@link org.springframework.cache.CacheManager} to use to create a default {@link CacheResolver}.
+     * Set the {@link CacheManager} to use to create a default {@link CacheResolver}.
      * Replace the current {@link CacheResolver}, if any.
      * @see #setCacheResolver
      * @see SimpleCacheResolver
      */
-    public void setCacheManager(org.springframework.cache.CacheManager cacheManager) {
+    public void setCacheManager(CacheManager cacheManager) {
         this.cacheResolver = SingletonSupplier.of(new SimpleCacheResolver(cacheManager));
     }
 
     /**
-     * Set the containing {@link BeanFactory} for {@link org.springframework.cache.CacheManager} and other
+     * Set the containing {@link BeanFactory} for {@link CacheManager} and other
      * service lookups.
      * @since 4.3
      */
@@ -213,7 +190,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
             // Lazily initialize cache resolver via default cache manager
             Assert.state(this.beanFactory != null, "CacheResolver or BeanFactory must be set on cache aspect");
             try {
-                setCacheManager(this.beanFactory.getBean(org.springframework.cache.CacheManager.class));
+                setCacheManager(this.beanFactory.getBean(CacheManager.class));
             }
             catch (NoUniqueBeanDefinitionException ex) {
                 throw new IllegalStateException("No CacheResolver specified, and no unique bean of type " +
@@ -242,10 +219,10 @@ public class CacheInterceptor extends AbstractCacheInvoker
         return ClassUtils.getQualifiedMethodName(specificMethod);
     }
 
-    protected Collection<? extends org.springframework.cache.Cache> getCaches(
+    protected Collection<? extends Cache> getCaches(
             CacheOperationInvocationContext<CacheOperation> context, CacheResolver cacheResolver) {
 
-        Collection<? extends org.springframework.cache.Cache> caches = cacheResolver.resolveCaches(context);
+        Collection<? extends Cache> caches = cacheResolver.resolveCaches(context);
         if (caches.isEmpty()) {
             throw new IllegalStateException("No cache could be resolved for '" +
                     context.getOperation() + "' using resolver '" + cacheResolver +
@@ -288,7 +265,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
                 operationCacheResolver = getBean(operation.getCacheResolver(), CacheResolver.class);
             }
             else if (StringUtils.hasText(operation.getCacheManager())) {
-                org.springframework.cache.CacheManager cacheManager = getBean(operation.getCacheManager(), CacheManager.class);
+                CacheManager cacheManager = getBean(operation.getCacheManager(), CacheManager.class);
                 operationCacheResolver = new SimpleCacheResolver(cacheManager);
             }
             else {
@@ -370,7 +347,8 @@ public class CacheInterceptor extends AbstractCacheInvoker
         }
 
         // Process any early evictions
-        processCacheEvicts(contexts.get(CacheEvictOperation.class), true, NO_RESULT);
+        processCacheEvicts(contexts.get(CacheEvictOperation.class), true,
+                CacheOperationExpressionEvaluator.NO_RESULT);
 
         // Check if we have a cached value matching the conditions
         Object cacheHit = findCachedValue(invoker, method, contexts);
@@ -383,8 +361,8 @@ public class CacheInterceptor extends AbstractCacheInvoker
     @Nullable
     private Object executeSynchronized(CacheOperationInvoker invoker, Method method, CacheOperationContexts contexts) {
         CacheOperationContext context = contexts.get(CacheableOperation.class).iterator().next();
-        if (isConditionPassing(context, NO_RESULT)) {
-            Object key = generateKey(context, NO_RESULT);
+        if (isConditionPassing(context, CacheOperationExpressionEvaluator.NO_RESULT)) {
+            Object key = generateKey(context, CacheOperationExpressionEvaluator.NO_RESULT);
             Cache cache = context.getCaches().iterator().next();
             if (CompletableFuture.class.isAssignableFrom(method.getReturnType())) {
                 return cache.retrieve(key, () -> (CompletableFuture<?>) invokeOperation(invoker));
@@ -415,14 +393,14 @@ public class CacheInterceptor extends AbstractCacheInvoker
     /**
      * Find a cached value only for {@link CacheableOperation} that passes the condition.
      * @param contexts the cacheable operations
-     * @return a {@link org.springframework.cache.Cache.ValueWrapper} holding the cached value,
+     * @return a {@link Cache.ValueWrapper} holding the cached value,
      * or {@code null} if none is found
      */
     @Nullable
     private Object findCachedValue(CacheOperationInvoker invoker, Method method, CacheOperationContexts contexts) {
         for (CacheOperationContext context : contexts.get(CacheableOperation.class)) {
-            if (isConditionPassing(context, NO_RESULT)) {
-                Object key = generateKey(context, NO_RESULT);
+            if (isConditionPassing(context, CacheOperationExpressionEvaluator.NO_RESULT)) {
+                Object key = generateKey(context, CacheOperationExpressionEvaluator.NO_RESULT);
                 Object cached = findInCaches(context, key, invoker, method, contexts);
                 if (cached != null) {
                     if (logger.isTraceEnabled()) {
@@ -548,11 +526,11 @@ public class CacheInterceptor extends AbstractCacheInvoker
         Collection<CacheOperationContext> excluded = new ArrayList<>(1);
         for (CacheOperationContext context : cachePutContexts) {
             try {
-                if (!context.isConditionPassing(RESULT_UNAVAILABLE)) {
+                if (!context.isConditionPassing(CacheOperationExpressionEvaluator.RESULT_UNAVAILABLE)) {
                     excluded.add(context);
                 }
             }
-            catch (Throwable ignore) {
+            catch (VariableNotAvailableException ex) {
                 // Ignoring failure due to missing result, consider the cache put has to proceed
             }
         }
@@ -596,7 +574,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
             CacheEvictOperation operation = (CacheEvictOperation) context.metadata.operation;
             if (isConditionPassing(context, result)) {
                 Object key = context.getGeneratedKey();
-                for (org.springframework.cache.Cache cache : context.getCaches()) {
+                for (Cache cache : context.getCaches()) {
                     if (operation.isCacheWide()) {
                         logInvalidating(context, operation, null);
                         doClear(cache, operation.isBeforeInvocation());
@@ -772,7 +750,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
 
         private final Object target;
 
-        private final Collection<? extends org.springframework.cache.Cache> caches;
+        private final Collection<? extends Cache> caches;
 
         private final Collection<String> cacheNames;
 
@@ -786,7 +764,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
             this.metadata = metadata;
             this.args = extractArgs(metadata.method, args);
             this.target = target;
-            this.caches = CacheInterceptor.this.getCaches(this, metadata.cacheResolver);
+            this.caches = ExpireSupportedCacheAspect.this.getCaches(this, metadata.cacheResolver);
             this.cacheNames = prepareCacheNames(this.caches);
         }
 
@@ -880,7 +858,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
                     this.target, this.metadata.targetClass, this.metadata.targetMethod, result);
         }
 
-        protected Collection<? extends org.springframework.cache.Cache> getCaches() {
+        protected Collection<? extends Cache> getCaches() {
             return this.caches;
         }
 
@@ -888,9 +866,9 @@ public class CacheInterceptor extends AbstractCacheInvoker
             return this.cacheNames;
         }
 
-        private Collection<String> prepareCacheNames(Collection<? extends org.springframework.cache.Cache> caches) {
+        private Collection<String> prepareCacheNames(Collection<? extends Cache> caches) {
             Collection<String> names = new ArrayList<>(caches.size());
-            for (org.springframework.cache.Cache cache : caches) {
+            for (Cache cache : caches) {
                 names.add(cache.getName());
             }
             return names;
@@ -974,7 +952,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
                     logger.trace("Creating cache entry for key '" + key + "' in cache(s) " +
                             this.context.getCacheNames());
                 }
-                for (org.springframework.cache.Cache cache : this.context.getCaches()) {
+                for (Cache cache : this.context.getCaches()) {
                     doPut(cache, key, value);
                 }
             }
@@ -1025,7 +1003,7 @@ public class CacheInterceptor extends AbstractCacheInvoker
         private final ReactiveAdapterRegistry registry = ReactiveAdapterRegistry.getSharedInstance();
 
         @Nullable
-        public Object executeSynchronized(CacheOperationInvoker invoker, Method method, org.springframework.cache.Cache cache, Object key) {
+        public Object executeSynchronized(CacheOperationInvoker invoker, Method method, Cache cache, Object key) {
             ReactiveAdapter adapter = this.registry.getAdapter(method.getReturnType());
             if (adapter != null) {
                 if (adapter.isMultiValue()) {
@@ -1132,134 +1110,4 @@ public class CacheInterceptor extends AbstractCacheInvoker
         }
     }
 
-
-    public static class CachedExpressionEvaluatorImpl extends CachedExpressionEvaluator {
-        private final StandardEvaluationContext originalEvaluationContext;
-        public CachedExpressionEvaluatorImpl(StandardEvaluationContext originalEvaluationContext) {
-            this.originalEvaluationContext = originalEvaluationContext;
-        }
-
-        public static final String RESULT_VARIABLE = "result";
-
-
-        private final Map<ExpressionKey, Expression> keyCache = new ConcurrentHashMap<>(64);
-
-        private final Map<ExpressionKey, Expression> conditionCache = new ConcurrentHashMap<>(64);
-
-        private final Map<ExpressionKey, Expression> unlessCache = new ConcurrentHashMap<>(64);
-
-
-        /**
-         * Create an {@link EvaluationContext}.
-         * @param caches the current caches
-         * @param method the method
-         * @param args the method arguments
-         * @param target the target object
-         * @param targetClass the target class
-         * @param result the return value (can be {@code null}) or
-         * {@link #NO_RESULT} if there is no return at this time
-         * @return the evaluation context
-         */
-        public EvaluationContext createEvaluationContext(Collection<? extends Cache> caches,
-                                                         Method method, Object[] args, Object target, Class<?> targetClass, Method targetMethod,
-                                                         @Nullable Object result) {
-
-            var rootObject = new RootClass(
-                    caches, method, args, target, targetClass);
-            ExpressionContext evaluationContext = new ExpressionContext(rootObject, targetMethod, args, new DefaultParameterNameDiscoverer());
-            this.originalEvaluationContext.applyDelegatesTo(evaluationContext);
-            if (result == RESULT_UNAVAILABLE) {
-                evaluationContext.addUnavailableVariable(RESULT_VARIABLE);
-            }
-            else if (result != NO_RESULT) {
-                evaluationContext.setVariable(RESULT_VARIABLE, result);
-            }
-            return evaluationContext;
-        }
-
-        @Nullable
-        public Object key(String keyExpression, AnnotatedElementKey methodKey, EvaluationContext evalContext) {
-            return getExpression(this.keyCache, methodKey, keyExpression).getValue(evalContext);
-        }
-
-        public boolean condition(String conditionExpression, AnnotatedElementKey methodKey, EvaluationContext evalContext) {
-            return (Boolean.TRUE.equals(getExpression(this.conditionCache, methodKey, conditionExpression).getValue(
-                    evalContext, Boolean.class)));
-        }
-
-        public boolean unless(String unlessExpression, AnnotatedElementKey methodKey, EvaluationContext evalContext) {
-            return (Boolean.TRUE.equals(getExpression(this.unlessCache, methodKey, unlessExpression).getValue(
-                    evalContext, Boolean.class)));
-        }
-
-        /**
-         * Clear all caches.
-         */
-        void clear() {
-            this.keyCache.clear();
-            this.conditionCache.clear();
-            this.unlessCache.clear();
-        }
-    }
-
-
-    public static class ExpressionContext extends MethodBasedEvaluationContext {
-        private final Set<String> unavailableVariables = new HashSet<>(1);
-
-        public ExpressionContext(Object rootObject, Method method, Object[] arguments, ParameterNameDiscoverer parameterNameDiscoverer) {
-            super(rootObject, method, arguments, parameterNameDiscoverer);
-        }
-
-        @Override
-        public Object lookupVariable(String name) {
-            if (unavailableVariables.contains(name)) {
-                throw new RuntimeException("Variable '" + name + "' not available");
-            }
-            return super.lookupVariable(name);
-        }
-
-        public void addUnavailableVariable(String resultVariable) {
-            unavailableVariables.add(resultVariable);
-        }
-    }
-
-    public static class RootClass {
-        private final Collection<? extends Cache> caches;
-
-        private final Method method;
-
-        private final Object[] args;
-
-        private final Object target;
-
-        private final Class<?> targetClass;
-
-        public RootClass(Collection<? extends Cache> caches, Method method, Object[] args, Object target, Class<?> targetClass) {
-            this.caches = caches;
-            this.method = method;
-            this.args = args;
-            this.target = target;
-            this.targetClass = targetClass;
-        }
-
-        public Collection<? extends Cache> getCaches() {
-            return caches;
-        }
-
-        public Method getMethod() {
-            return method;
-        }
-
-        public Object[] getArgs() {
-            return args;
-        }
-
-        public Object getTarget() {
-            return target;
-        }
-
-        public Class<?> getTargetClass() {
-            return targetClass;
-        }
-    }
 }
