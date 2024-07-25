@@ -21,6 +21,10 @@ public class CachePutExpireOperation extends CachePutOperation {
         this.ttl = b.ttl;
     }
 
+    public Duration getTtl() {
+        return ttl;
+    }
+
     public static class Builder extends CachePutOperation.Builder {
 
         private Duration ttl;

@@ -1,5 +1,7 @@
 package org.springframework.cache.interceptor;
 
+import com.github.heng.cache.CachePutExpireOperation;
+import com.github.heng.cache.CacheableExpireOperation;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.reactivestreams.Subscriber;
@@ -24,6 +26,7 @@ import reactor.core.publisher.Mono;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -310,7 +313,7 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
     protected Object execute(CacheOperationInvoker invoker, Object target, Method method, Object[] args) {
         // Check whether aspect is enabled (to cope with cases where the AJ is pulled in automatically)
         if (this.initialized) {
-            Class<?> targetClass = AopProxyUtils.ultimateTargetClass(target);
+            Class<?> targetClass = ultimateTargetClass(target);
             CacheOperationSource cacheOperationSource = getCacheOperationSource();
             if (cacheOperationSource != null) {
                 Collection<CacheOperation> operations = cacheOperationSource.getCacheOperations(method, targetClass);
@@ -322,6 +325,13 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
         }
 
         return invokeOperation(invoker);
+    }
+
+    private Class<?> ultimateTargetClass (Object object) {
+        if (object.getClass().getName().contains("ByteBuddy")) {
+            return object.getClass().getSuperclass();
+        }
+        return AopProxyUtils.ultimateTargetClass(object);
     }
 
     /**
@@ -364,25 +374,48 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
         if (isConditionPassing(context, CacheOperationExpressionEvaluator.NO_RESULT)) {
             Object key = generateKey(context, CacheOperationExpressionEvaluator.NO_RESULT);
             Cache cache = context.getCaches().iterator().next();
-            if (CompletableFuture.class.isAssignableFrom(method.getReturnType())) {
-                return cache.retrieve(key, () -> (CompletableFuture<?>) invokeOperation(invoker));
-            }
-            if (this.reactiveCachingHandler != null) {
-                Object returnValue = this.reactiveCachingHandler.executeSynchronized(invoker, method, cache, key);
-                if (returnValue != ReactiveCachingHandler.NOT_HANDLED) {
-                    return returnValue;
+            if (cache instanceof com.github.heng.cache.Cache expireCache) {
+                if (CompletableFuture.class.isAssignableFrom(method.getReturnType())) {
+                    return expireCache.retrieve(key, () -> (CompletableFuture<?>) invokeOperation(invoker), context.ttl);
+                }
+                if (this.reactiveCachingHandler != null) {
+                    Object returnValue = this.reactiveCachingHandler.executeSynchronized(invoker, method, cache, key, context.ttl);
+                    if (returnValue != ReactiveCachingHandler.NOT_HANDLED) {
+                        return returnValue;
+                    }
+                }
+                try {
+                    return wrapCacheValue(method, expireCache.get(key, () -> unwrapReturnValue(invokeOperation(invoker)), context.ttl));
+                }
+                catch (Cache.ValueRetrievalException ex) {
+                    // Directly propagate ThrowableWrapper from the invoker,
+                    // or potentially also an IllegalArgumentException etc.
+                    ReflectionUtils.rethrowRuntimeException(ex.getCause());
+                    // Never reached
+                    return null;
+                }
+            }else {
+                if (CompletableFuture.class.isAssignableFrom(method.getReturnType())) {
+                    return cache.retrieve(key, () -> (CompletableFuture<?>) invokeOperation(invoker));
+                }
+                if (this.reactiveCachingHandler != null) {
+                    Object returnValue = this.reactiveCachingHandler.executeSynchronized(invoker, method, cache, key, null);
+                    if (returnValue != ReactiveCachingHandler.NOT_HANDLED) {
+                        return returnValue;
+                    }
+                }
+                try {
+                    return wrapCacheValue(method, cache.get(key, () -> unwrapReturnValue(invokeOperation(invoker))));
+                }
+                catch (Cache.ValueRetrievalException ex) {
+                    // Directly propagate ThrowableWrapper from the invoker,
+                    // or potentially also an IllegalArgumentException etc.
+                    ReflectionUtils.rethrowRuntimeException(ex.getCause());
+                    // Never reached
+                    return null;
                 }
             }
-            try {
-                return wrapCacheValue(method, cache.get(key, () -> unwrapReturnValue(invokeOperation(invoker))));
-            }
-            catch (Cache.ValueRetrievalException ex) {
-                // Directly propagate ThrowableWrapper from the invoker,
-                // or potentially also an IllegalArgumentException etc.
-                ReflectionUtils.rethrowRuntimeException(ex.getCause());
-                // Never reached
-                return null;
-            }
+
         }
         else {
             // No caching required, just call the underlying method
@@ -723,7 +756,7 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
         private final KeyGenerator keyGenerator;
 
         private final CacheResolver cacheResolver;
-
+        private final Duration ttl;
         public CacheOperationMetadata(CacheOperation operation, Method method, Class<?> targetClass,
                                       KeyGenerator keyGenerator, CacheResolver cacheResolver) {
 
@@ -735,6 +768,13 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
             this.methodKey = new AnnotatedElementKey(this.targetMethod, targetClass);
             this.keyGenerator = keyGenerator;
             this.cacheResolver = cacheResolver;
+            if (operation instanceof CacheableExpireOperation expireOperation) {
+                ttl = expireOperation.getTtl();
+            }else if (operation instanceof CachePutExpireOperation expireOperation){
+                ttl = expireOperation.getTtl();
+            }else {
+                ttl = null;
+            }
         }
     }
 
@@ -754,18 +794,19 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
 
         private final Collection<String> cacheNames;
 
+        private final Duration ttl;
         @Nullable
         private Boolean conditionPassing;
 
         @Nullable
         private Object key;
-
         public CacheOperationContext(CacheOperationMetadata metadata, Object[] args, Object target) {
             this.metadata = metadata;
             this.args = extractArgs(metadata.method, args);
             this.target = target;
             this.caches = ExpireSupportedCacheAspect.this.getCaches(this, metadata.cacheResolver);
             this.cacheNames = prepareCacheNames(this.caches);
+            this.ttl = metadata.ttl;
         }
 
         @Override
@@ -953,7 +994,11 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
                             this.context.getCacheNames());
                 }
                 for (Cache cache : this.context.getCaches()) {
-                    doPut(cache, key, value);
+                    if (cache instanceof com.github.heng.cache.Cache expireCache) {
+                        expireCache.put(key, value, context.ttl);
+                    }else {
+                        doPut(cache, key, value);
+                    }
                 }
             }
         }
@@ -1003,32 +1048,60 @@ public class ExpireSupportedCacheAspect extends AbstractCacheInvoker
         private final ReactiveAdapterRegistry registry = ReactiveAdapterRegistry.getSharedInstance();
 
         @Nullable
-        public Object executeSynchronized(CacheOperationInvoker invoker, Method method, Cache cache, Object key) {
+        public Object executeSynchronized(CacheOperationInvoker invoker, Method method, Cache cache, Object key, Duration ttl) {
             ReactiveAdapter adapter = this.registry.getAdapter(method.getReturnType());
-            if (adapter != null) {
-                if (adapter.isMultiValue()) {
-                    // Flux or similar
-                    return adapter.fromPublisher(Flux.from(Mono.fromFuture(
-                                    cache.retrieve(key,
-                                            () -> Flux.from(adapter.toPublisher(invokeOperation(invoker))).collectList().toFuture())))
-                            .flatMap(Flux::fromIterable));
-                }
-                else {
-                    // Mono or similar
-                    return adapter.fromPublisher(Mono.fromFuture(
-                            cache.retrieve(key,
-                                    () -> Mono.from(adapter.toPublisher(invokeOperation(invoker))).toFuture())));
-                }
-            }
-            if (KotlinDetector.isKotlinReflectPresent() && KotlinDetector.isSuspendingFunction(method)) {
-                return Mono.fromFuture(cache.retrieve(key, () -> {
-                    Mono<?> mono = ((Mono<?>) invokeOperation(invoker));
-                    if (mono == null) {
-                        mono = Mono.empty();
+            if (cache instanceof com.github.heng.cache.Cache expireCache) {
+                if (adapter != null) {
+                    if (adapter.isMultiValue()) {
+                        // Flux or similar
+                        return adapter.fromPublisher(Flux.from(Mono.fromFuture(
+                                        expireCache.retrieve(key,
+                                                () -> Flux.from(adapter.toPublisher(invokeOperation(invoker))).collectList().toFuture(), ttl)))
+                                .flatMap(Flux::fromIterable));
                     }
-                    return mono.toFuture();
-                }));
+                    else {
+                        // Mono or similar
+                        return adapter.fromPublisher(Mono.fromFuture(
+                                expireCache.retrieve(key,
+                                        () -> Mono.from(adapter.toPublisher(invokeOperation(invoker))).toFuture(), ttl)));
+                    }
+                }
+                if (KotlinDetector.isKotlinReflectPresent() && KotlinDetector.isSuspendingFunction(method)) {
+                    return Mono.fromFuture(cache.retrieve(key, () -> {
+                        Mono<?> mono = ((Mono<?>) invokeOperation(invoker));
+                        if (mono == null) {
+                            mono = Mono.empty();
+                        }
+                        return mono.toFuture();
+                    }));
+                }
+            }else {
+                if (adapter != null) {
+                    if (adapter.isMultiValue()) {
+                        // Flux or similar
+                        return adapter.fromPublisher(Flux.from(Mono.fromFuture(
+                                        cache.retrieve(key,
+                                                () -> Flux.from(adapter.toPublisher(invokeOperation(invoker))).collectList().toFuture())))
+                                .flatMap(Flux::fromIterable));
+                    }
+                    else {
+                        // Mono or similar
+                        return adapter.fromPublisher(Mono.fromFuture(
+                                cache.retrieve(key,
+                                        () -> Mono.from(adapter.toPublisher(invokeOperation(invoker))).toFuture())));
+                    }
+                }
+                if (KotlinDetector.isKotlinReflectPresent() && KotlinDetector.isSuspendingFunction(method)) {
+                    return Mono.fromFuture(cache.retrieve(key, () -> {
+                        Mono<?> mono = ((Mono<?>) invokeOperation(invoker));
+                        if (mono == null) {
+                            mono = Mono.empty();
+                        }
+                        return mono.toFuture();
+                    }));
+                }
             }
+
             return NOT_HANDLED;
         }
 

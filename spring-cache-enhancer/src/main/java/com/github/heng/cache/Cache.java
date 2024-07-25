@@ -14,13 +14,13 @@ import java.util.function.Supplier;
 public interface Cache extends org.springframework.cache.Cache {
 
     @Nullable
-    <T> T get(Object key, Callable<T> valueLoader, Duration ttl);
+    <T> T get(Object key, Callable<T> valueLoader, @Nullable Duration ttl);
 
-    <T> CompletableFuture<T> retrieve(Object key, Supplier<CompletableFuture<T>> valueLoader, Duration ttl);
+    <T> CompletableFuture<T> retrieve(Object key, Supplier<CompletableFuture<T>> valueLoader, @Nullable Duration ttl);
 
-    void put(Object key, @Nullable Object value, Duration ttl);
+    void put(Object key, @Nullable Object value, @Nullable Duration ttl);
 
-    default ValueWrapper putIfAbsent(Object key, @Nullable Object value, Duration ttl) {
+    default ValueWrapper putIfAbsent(Object key, @Nullable Object value, @Nullable Duration ttl) {
         ValueWrapper existingValue = get(key);
         if (existingValue == null) {
             put(key, value, ttl);

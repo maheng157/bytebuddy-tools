@@ -3,13 +3,13 @@ package com.github.heng.cache.redis;
 import com.github.heng.cache.Cache;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.cache.support.SimpleValueWrapper;
 import org.springframework.data.redis.cache.RedisCacheConfiguration;
 import org.springframework.data.redis.cache.RedisCacheWriter;
 import org.springframework.lang.Nullable;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -71,33 +71,20 @@ public class RedisCache extends org.springframework.data.redis.cache.RedisCache 
 
     @Override
     public void put(Object key, Object value, Duration ttl) {
+        if (Objects.isNull(ttl)) {
+            put(key, value);
+            return;
+        }
         Object cacheValue = processAndCheckValue(value);
 
         byte[] binaryKey = createAndConvertCacheKey(key);
         byte[] binaryValue = serializeCacheValue(cacheValue);
 
-
         getCacheWriter().put(getName(), binaryKey, binaryValue, ttl);
-    }
-
-    @Override
-    public ValueWrapper putIfAbsent(Object key, Object value, Duration ttl) {
-        Object cacheValue = preProcessCacheValue(value);
-
-        if (nullCacheValueIsNotAllowed(cacheValue)) {
-            return get(key);
-        }
-
-        byte[] binaryKey = createAndConvertCacheKey(key);
-        byte[] binaryValue = serializeCacheValue(cacheValue);
-        byte[] result = getCacheWriter().putIfAbsent(getName(), binaryKey, binaryValue, ttl);
-
-        return result != null ? new SimpleValueWrapper(fromStoreValue(deserializeCacheValue(result))) : null;
     }
 
     @SuppressWarnings("unchecked")
     private <T> T getSynchronized(Object key, Callable<T> valueLoader, Duration ttl) {
-
         ReentrantLock lock = map.compute(key, (k, v) -> v == null ? new ReentrantLock():v);
         try {
             lock.lock();
@@ -110,7 +97,9 @@ public class RedisCache extends org.springframework.data.redis.cache.RedisCache 
     }
 
     protected <T> T loadCacheValue(Object key, Callable<T> valueLoader, Duration ttl) {
-
+        if (Objects.isNull(ttl)) {
+            return loadCacheValue(key, valueLoader);
+        }
         T value;
 
         try {
